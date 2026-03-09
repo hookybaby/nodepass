@@ -1,71 +1,90 @@
-// 内部包，实现服务端模式功能
 package internal
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/NodePassProject/conn"
 	"github.com/NodePassProject/logs"
+	"github.com/NodePassProject/nph2"
+	"github.com/NodePassProject/npws"
 	"github.com/NodePassProject/pool"
+	"github.com/NodePassProject/quic"
 )
 
-// Server 实现服务端模式功能
-type Server struct {
-	Common                // 继承共享功能
-	tlsConfig *tls.Config // TLS配置
-	clientIP  string      // 客户端IP
-}
+type Server struct{ Common }
 
-// NewServer 创建新的服务端实例
-func NewServer(parsedURL *url.URL, tlsCode string, tlsConfig *tls.Config, logger *logs.Logger) *Server {
+func NewServer(parsedURL *url.URL, tlsCode string, tlsConfig *tls.Config, logger *logs.Logger) (*Server, error) {
 	server := &Server{
 		Common: Common{
+			parsedURL:  parsedURL,
 			tlsCode:    tlsCode,
-			dataFlow:   "+",
+			tlsConfig:  tlsConfig,
 			logger:     logger,
-			semaphore:  make(chan struct{}, semaphoreLimit),
-			signalChan: make(chan string, semaphoreLimit),
+			signalChan: make(chan Signal, semaphoreLimit),
+			writeChan:  make(chan []byte, semaphoreLimit),
+			verifyChan: make(chan struct{}),
+			tcpBufferPool: &sync.Pool{
+				New: func() any {
+					buf := make([]byte, tcpDataBufSize)
+					return &buf
+				},
+			},
+			udpBufferPool: &sync.Pool{
+				New: func() any {
+					buf := make([]byte, udpDataBufSize)
+					return &buf
+				},
+			},
 		},
-		tlsConfig: tlsConfig,
 	}
-	// 初始化公共字段
-	server.getTunnelKey(parsedURL)
-	server.getPoolCapacity(parsedURL)
-	server.getAddress(parsedURL)
-	return server
+	if err := server.initConfig(); err != nil {
+		return nil, fmt.Errorf("newServer: initConfig failed: %w", err)
+	}
+	server.initRateLimiter()
+	return server, nil
 }
 
-// Run 管理服务端生命周期
 func (s *Server) Run() {
-	s.logger.Info("Server started: %v@%v/%v", s.tunnelKey, s.tunnelAddr, s.targetTCPAddr)
+	logInfo := func(prefix string) {
+		s.logger.Info("%v: server://%v@%v/%v?dns=%v&lbs=%v&max=%v&mode=%v&type=%v&dial=%v&read=%v&rate=%v&slot=%v&proxy=%v&block=%v&notcp=%v&noudp=%v",
+			prefix, s.tunnelKey, s.tunnelTCPAddr, s.getTargetAddrsString(), s.dnsCacheTTL, s.lbStrategy, s.maxPoolCapacity,
+			s.runMode, s.poolType, s.dialerIP, s.readTimeout, s.rateLimit/125000, s.slotLimit,
+			s.proxyProtocol, s.blockProtocol, s.disableTCP, s.disableUDP)
+	}
+	logInfo("Server started")
 
-	// 启动服务端并处理重启
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
 	go func() {
-		for {
-			time.Sleep(serviceCooldown)
-			if err := s.start(); err != nil {
+		for ctx.Err() == nil {
+			if err := s.start(); err != nil && err != io.EOF {
 				s.logger.Error("Server error: %v", err)
 				s.stop()
-				s.logger.Info("Server restarted: %v@%v/%v", s.tunnelKey, s.tunnelAddr, s.targetTCPAddr)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(serviceCooldown):
+				}
+				logInfo("Server restart")
 			}
 		}
 	}()
 
-	// 监听系统信号以优雅关闭
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	<-ctx.Done()
 	stop()
 
-	// 执行关闭过程
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := s.shutdown(shutdownCtx, s.stop); err != nil {
@@ -75,102 +94,175 @@ func (s *Server) Run() {
 	}
 }
 
-// start 启动服务端
 func (s *Server) start() error {
-	// 初始化上下文
 	s.initContext()
 
-	// 初始化隧道监听器
 	if err := s.initTunnelListener(); err != nil {
-		return err
+		return fmt.Errorf("start: initTunnelListener failed: %w", err)
 	}
 
-	// 通过是否监听成功判断数据流向
-	if err := s.initTargetListener(); err == nil {
-		s.dataFlow = "-"
-	}
-
-	// 与客户端进行握手
-	if err := s.tunnelHandshake(); err != nil {
-		return err
-	}
-
-	// 握手之后把UDP监听关掉
 	if s.tunnelUDPConn != nil {
 		s.tunnelUDPConn.Close()
 	}
 
-	// 初始化隧道连接池
-	s.tunnelPool = pool.NewServerPool(
-		s.maxPoolCapacity,
-		s.clientIP,
-		s.tlsConfig,
-		s.tunnelListener,
-		reportInterval)
+	switch s.runMode {
+	case "1":
+		if err := s.initTargetListener(); err != nil {
+			return fmt.Errorf("start: initTargetListener failed: %w", err)
+		}
+		s.dataFlow = "-"
+	case "2":
+		s.dataFlow = "+"
+	default:
+		if err := s.initTargetListener(); err == nil {
+			s.runMode = "1"
+			s.dataFlow = "-"
+		} else {
+			s.runMode = "2"
+			s.dataFlow = "+"
+		}
+	}
 
-	go s.tunnelPool.ServerManager()
+	s.logger.Info("Pending tunnel handshake...")
+	s.handshakeStart = time.Now()
+	if err := s.tunnelHandshake(); err != nil {
+		return fmt.Errorf("start: tunnelHandshake failed: %w", err)
+	}
+
+	if err := s.initTunnelPool(); err != nil {
+		return fmt.Errorf("start: initTunnelPool failed: %w", err)
+	}
+
+	s.logger.Info("Getting tunnel pool ready...")
+	if err := s.setControlConn(); err != nil {
+		return fmt.Errorf("start: setControlConn failed: %w", err)
+	}
 
 	if s.dataFlow == "-" {
 		go s.commonLoop()
 	}
 
-	return s.commonControl()
+	if err := s.commonControl(); err != nil {
+		return fmt.Errorf("start: commonControl failed: %w", err)
+	}
+	return nil
 }
 
-// tunnelHandshake 与客户端进行握手
-func (s *Server) tunnelHandshake() error {
-	// 接受隧道连接
-	for {
-		tunnelTCPConn, err := s.tunnelListener.Accept()
-		if err != nil {
-			s.logger.Error("Accept error: %v", err)
-			time.Sleep(serviceCooldown)
-			continue
-		}
-
-		tunnelTCPConn.SetReadDeadline(time.Now().Add(tcpReadTimeout))
-
-		bufReader := bufio.NewReader(tunnelTCPConn)
-		rawTunnelKey, err := bufReader.ReadString('\n')
-		if err != nil {
-			s.logger.Warn("Handshake timeout: %v", tunnelTCPConn.RemoteAddr())
-			tunnelTCPConn.Close()
-			time.Sleep(serviceCooldown)
-			continue
-		}
-
-		tunnelTCPConn.SetReadDeadline(time.Time{})
-		tunnelKey := string(s.xor(bytes.TrimSuffix([]byte(rawTunnelKey), []byte{'\n'})))
-
-		if tunnelKey != s.tunnelKey {
-			s.logger.Warn("Access denied: %v", tunnelTCPConn.RemoteAddr())
-			tunnelTCPConn.Close()
-			time.Sleep(serviceCooldown)
-			continue
-		} else {
-			s.tunnelTCPConn = tunnelTCPConn.(*net.TCPConn)
-			s.bufReader = bufio.NewReader(&conn.TimeoutReader{Conn: s.tunnelTCPConn, Timeout: tcpReadTimeout})
-			s.tunnelTCPConn.SetKeepAlive(true)
-			s.tunnelTCPConn.SetKeepAlivePeriod(reportInterval)
-
-			// 记录客户端IP
-			s.clientIP = s.tunnelTCPConn.RemoteAddr().(*net.TCPAddr).IP.String()
-			break
-		}
+func (s *Server) initTunnelPool() error {
+	switch s.poolType {
+	case "0":
+		tcpPool := pool.NewServerPool(
+			s.maxPoolCapacity,
+			s.clientIP,
+			s.tlsConfig,
+			s.tunnelListener,
+			reportInterval)
+		go tcpPool.ServerManager()
+		s.tunnelPool = tcpPool
+	case "1":
+		quicPool := quic.NewServerPool(
+			s.maxPoolCapacity,
+			s.clientIP,
+			s.tlsConfig,
+			s.tunnelUDPAddr.String(),
+			reportInterval)
+		go quicPool.ServerManager()
+		s.tunnelPool = quicPool
+	case "2":
+		websocketPool := npws.NewServerPool(
+			s.maxPoolCapacity,
+			"",
+			s.tlsConfig,
+			s.tunnelListener,
+			reportInterval)
+		go websocketPool.ServerManager()
+		s.tunnelPool = websocketPool
+	case "3":
+		http2Pool := nph2.NewServerPool(
+			s.maxPoolCapacity,
+			s.clientIP,
+			s.tlsConfig,
+			s.tunnelListener,
+			reportInterval)
+		go http2Pool.ServerManager()
+		s.tunnelPool = http2Pool
+	default:
+		return fmt.Errorf("initTunnelPool: unknown pool type: %s", s.poolType)
 	}
-
-	// 构建并发送隧道URL到客户端
-	tunnelURL := &url.URL{
-		Host:     s.dataFlow,
-		Fragment: s.tlsCode,
-	}
-
-	_, err := s.tunnelTCPConn.Write(append(s.xor([]byte(tunnelURL.String())), '\n'))
-	if err != nil {
-		return err
-	}
-
-	s.logger.Info("Tunnel signal -> : %v -> %v", tunnelURL.String(), s.tunnelTCPConn.RemoteAddr())
-	s.logger.Info("Tunnel handshaked: %v <-> %v", s.tunnelTCPConn.LocalAddr(), s.tunnelTCPConn.RemoteAddr())
 	return nil
+}
+
+func (s *Server) tunnelHandshake() error {
+	var clientIP string
+	done := make(chan struct{})
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "close")
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if r.URL.Path != "/" {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") || !s.verifyAuthToken(strings.TrimPrefix(auth, "Bearer ")) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		clientIP = r.RemoteAddr
+		if host, _, err := net.SplitHostPort(clientIP); err == nil {
+			clientIP = host
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"flow": s.dataFlow,
+			"max":  s.maxPoolCapacity,
+			"tls":  s.tlsCode,
+			"type": s.poolType,
+		})
+
+		s.logger.Info("Sending tunnel config: FLOW=%v|MAX=%v|TLS=%v|TYPE=%v",
+			s.dataFlow, s.maxPoolCapacity, s.tlsCode, s.poolType)
+
+		close(done)
+	})
+
+	tlsConfig := s.tlsConfig
+	if tlsConfig == nil {
+		tlsConfig, _ = NewTLSConfig()
+	}
+
+	server := &http.Server{
+		Handler:   handler,
+		TLSConfig: tlsConfig,
+		ErrorLog:  s.logger.StdLogger(),
+	}
+	go server.ServeTLS(s.tunnelListener, "", "")
+
+	select {
+	case <-done:
+		server.Close()
+		s.clientIP = clientIP
+		if s.tlsCode == "1" {
+			if newTLSConfig, err := NewTLSConfig(); err == nil {
+				newTLSConfig.MinVersion = tls.VersionTLS13
+				s.tlsConfig = newTLSConfig
+				s.logger.Info("TLS code-1: RAM cert regenerated with TLS 1.3")
+			} else {
+				s.logger.Warn("Failed to regenerate RAM cert: %v", err)
+			}
+		}
+
+		s.tunnelListener, _ = net.ListenTCP("tcp", s.tunnelTCPAddr)
+		return nil
+	case <-s.ctx.Done():
+		server.Close()
+		return fmt.Errorf("tunnelHandshake: context canceled")
+	}
 }
